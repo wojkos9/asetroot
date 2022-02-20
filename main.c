@@ -9,7 +9,8 @@
 #include <X11/Xatom.h>
 
 #include <Imlib2.h>
-
+#include <semaphore.h>
+#include <pthread.h>
 /* GLOBALS */
 
 Display            *XDPY;
@@ -22,6 +23,8 @@ Visual             *VISUAL;
 int NUMBER_OF_FRAMES;
 Atom prop_root, prop_esetroot;
 int keep_looping;
+sem_t load_sem;
+sem_t process_sem;
 
 /* ARGS */
 
@@ -130,6 +133,7 @@ set_pixmap_property(Pixmap p)
     XFlush(XDPY);
 }
 
+Imlib_Image *images;
 Imlib_Image *load_images_from_folder_formatted(const char* folder_path, const char* format) {
 	int frame_number = 0;
 	char current_file[256];
@@ -142,36 +146,58 @@ Imlib_Image *load_images_from_folder_formatted(const char* folder_path, const ch
 	memset(current_file, 0, sizeof(current_file));
 	strcat(current_file, folder_path);
 	strcat(current_file, file_name);
-	Imlib_Image *images = NULL;
-	while (access(current_file, R_OK) != -1){
-		Imlib_Image temp_image;
-		temp_image = imlib_load_image(current_file);
+	while (access(current_file, R_OK) != -1) {
 		frame_number++;
-		images = realloc(images, frame_number*sizeof(char*));
-		*(images+frame_number-1) = temp_image;
 		memset(current_file, 0, sizeof(current_file));
 		snprintf(file_name, 128, format, frame_number);
 		strcat(current_file, folder_path);
 		strcat(current_file, file_name);
 	}
 	NUMBER_OF_FRAMES = frame_number;
+	images = malloc(NUMBER_OF_FRAMES * sizeof(Imlib_Image *));
+	sem_post(&load_sem);
+	for (int i = 0; i < frame_number; i++) {
+		Imlib_Image temp_image;
+		memset(current_file, 0, sizeof(current_file));
+		snprintf(file_name, 128, format, i);
+		strcat(current_file, folder_path);
+		strcat(current_file, file_name);
+		temp_image = imlib_load_image(current_file);
+		*(images+i) = temp_image;
+		sem_post(&load_sem);
+	}
 	return images;
 }
 
+Pixmap *pixmaps;
 Pixmap *load_pixmaps_from_images(const Imlib_Image *images, const int amount)
 {
 	int width = WidthOfScreen(XSCRN);
 	int height = HeightOfScreen(XSCRN);
-	Pixmap *temp = malloc(sizeof(Pixmap)*amount);
+	Pixmap *temp = pixmaps;
 	for (int i = 0; i < amount; i++) {
 		*(temp+i) = XCreatePixmap(XDPY, ROOT_WIN, width, height, BITDEPTH);
 		imlib_context_set_drawable(*(temp+i));
+		sem_wait(&load_sem);
 		imlib_context_set_image(*(images+i));
 		imlib_render_image_on_drawable(0, 0);
 		imlib_context_set_image(images[i]);
+
 		imlib_free_image();
+		sem_post(&process_sem);
 	}
-	return temp;
+	return NULL;
+}
+
+void *th_load_images(void *p) {
+	load_images_from_folder_formatted(FOLDER_NAME, FRAME_FILE_NAME_FORMAT);
+	return NULL;
+}
+
+void *th_load_pixmaps(void *p)
+{
+	load_pixmaps_from_images(images, NUMBER_OF_FRAMES);
+	return NULL;
 }
 
 struct timespec timespec_get_difference(struct timespec start, struct timespec end)
@@ -183,7 +209,7 @@ struct timespec timespec_get_difference(struct timespec start, struct timespec e
             temp.tv_sec = end.tv_sec-start.tv_sec-1;
             temp.tv_nsec = 1000000000+end.tv_nsec-start.tv_nsec;
     }
-    else 
+    else
     {
             temp.tv_sec = end.tv_sec-start.tv_sec;
             temp.tv_nsec = end.tv_nsec-start.tv_nsec;
@@ -203,6 +229,8 @@ int main(int argc, const char *argv[])
 		print_usage();
 		exit(1);
 	}
+
+	XInitThreads();
 	parse_args(argc, argv);
 
 	struct timespec start={0,0}, end={0,0};
@@ -220,19 +248,23 @@ int main(int argc, const char *argv[])
 	imlib_context_set_visual(VISUAL);
 	imlib_context_set_colormap(COLORMAP);
 
-	Imlib_Image *entries = load_images_from_folder_formatted(FOLDER_NAME, FRAME_FILE_NAME_FORMAT);
-	if (!entries) {
+	pthread_t load_th, process_th;
+	sem_init(&load_sem, 0, 0);
+	sem_init(&process_sem, 0, 0);
+
+	pthread_create(&load_th, NULL, th_load_images, NULL);
+	sem_wait(&load_sem);
+	if (!images) {
 		printf("Failed loading images from the folder %s\n", FOLDER_NAME);
 		printf("Format: %s\n", FRAME_FILE_NAME_FORMAT);
 		exit(1);
 	}
-
-	Pixmap *pixmaps = load_pixmaps_from_images(entries, NUMBER_OF_FRAMES);
+	pixmaps = malloc(sizeof(Pixmap)*NUMBER_OF_FRAMES);
 	if (!pixmaps) {
 		printf("Failed to initialize pixmaps\n");
 		exit(1);
 	}
-
+	pthread_create(&process_th, NULL, th_load_pixmaps, NULL);
 	int current = 0;
 	int difference;
 	clock_gettime(CLOCK_REALTIME, &start);
@@ -241,7 +273,11 @@ int main(int argc, const char *argv[])
 	signal(SIGINT, exit_loop);
 	signal(SIGTERM, exit_loop);
 	keep_looping = 1;
+	int looped = 0;
 	while (keep_looping) {
+		if (!looped) {
+			sem_wait(&process_sem);
+		}
 		current_pixmap = *(pixmaps+current);
 		set_pixmap_property(current_pixmap);
 
@@ -251,6 +287,7 @@ int main(int argc, const char *argv[])
 		current++;
 		if (current >= NUMBER_OF_FRAMES) {
 			current = 0;
+			looped = 1;
 		}
 
 		clock_gettime(CLOCK_REALTIME, &end);
@@ -265,9 +302,11 @@ int main(int argc, const char *argv[])
 	for (int i = 0; i < NUMBER_OF_FRAMES; i++) {
 		XFreePixmap(XDPY, *(pixmaps+i));
 	}
+	pthread_join(load_th, NULL);
+	pthread_join(process_th, NULL);
 
 	free(pixmaps);
-	free(entries);
+	free(images);
 
 	return 0;
 }
